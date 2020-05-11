@@ -1,0 +1,823 @@
+//time scale calculation for channel flow
+//this cose is used to calculate correlation using moving eulerian frame whics is
+//moving with average air velocity.
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <complex>
+#include <sys/types.h>
+#include <cstdio>
+#include <cstdlib>
+#include <math.h>
+#include <string>
+#include <time.h>
+#include <netinet/in.h>
+#include <byteswap.h>
+#include <assert.h>
+
+using namespace std;
+
+
+/*
+int const Max_N_time=150;
+int const Max_Nd_   =4;
+int const Max_Nx_   =65;
+int const Max_Ny_   =65;
+int const Max_Nz_   =65;
+int const Max_length = Max_Nd_* Max_Nx_*Max_Ny_*Max_Nz_;
+*/
+
+double Pi=3.14159265;
+int const Nd_=3 ;
+int const Max_Nd_ =4;
+int const Nx_= 128 ;
+int const Ny_=65 ;
+int const Nz_=64 ;
+int const nx_step=4;
+int const nz_step=2;
+
+
+
+
+int const Max_length = Max_Nd_* Nx_*Ny_*Nz_;
+int const n_data=Nd_*Nx_*Ny_*Nz_;
+int const Romegaomega_dimen=Max_Nd_*Ny_;
+//int const omega_dimen=Nd_*(Nx_/2)*Ny_*(Nz_/2);
+int const omega_dimen=Nd_*(Nx_)*Ny_*(Nz_);
+int const omega_pdt_dimen= Max_Nd_* (Nx_/nx_step)*Ny_*(Nz_/nz_step);
+
+int const Max_time_step=401;//801;omega_mean
+
+int const n_corre_length=200;//400;
+int const n_origin =10;            // at a strech how many origin will be grouped
+
+float const  del_t=0.25;
+
+float a=0, b=2.0;      // y- bound used in DNS
+
+double x_p,delta_x,b_lx,omega_interpolated,error;
+int nx_part,n_point,n_order,min_limit,max_limit;
+
+
+string i2s(int);
+
+string i2s(int n) {
+  const int Nbuf = 32;
+  char buff[Nbuf];
+  if (n >= 0)
+    sprintf(buff, "%d", n);
+  else {
+    n = abs(n);
+    sprintf(buff, "_%d", n);
+  }
+  return string(buff);
+}
+
+inline int flatten(int, int, int, int);
+inline int flatten(int, int);
+inline int flatten_1(int , int , int , int );
+enum fieldstate { Physical, Spectral };
+
+ fieldstate xzstate_;
+ fieldstate ystate_;
+
+
+void read(ifstream& is, int& n);
+void read(ifstream& is, bool& b);
+void read(ifstream& is, double& x);
+void read(ifstream& is, fieldstate& s);
+
+ofstream & operator << (ofstream & os, fieldstate f);
+ifstream & operator >> (ifstream & is, fieldstate & f);
+ int major_version=0, minor_version=0, update_version=0;
+int rough_Nx_=0,rough_Ny_=0,rough_Nz_=0,rough_Nd_=0;
+double rough_Lx_=0,rough_Lz_=0,rough_a_=0,rough_b_=0;
+ bool dealiasIO_=false; 
+
+/*
+  int    N_count[Max_time_step][Max_length];
+  float  omega[n_origin+n_correlation_length][n_data],y[Ny_];//Umean[Ny_];
+  float  omega_avg[Max_time_step][Ny_*Nd_];
+  float  omega_mean[Ny_*Nd_];
+  float  u_mean[Ny_*Nd_];
+  float  omega_pdt[Max_time_step][Max_length];
+  float  Romegaomega[Max_time_step][Ny_*Max_Nd_];   
+*/
+float  omega_avg[Max_time_step][Ny_*Nd_];
+
+
+int *N_count;
+double omega_read;
+float * omega_inst;
+float **omega,*omega_mean,*u_mean, **omega_pdt,**Romegaomega;// **omega_avg,
+float *y;
+void polint(double xa[], double ya[], int n, double x, double *yy,double *dy);
+
+int main()
+{
+
+
+  time_t start,end;
+  time(& start);
+  n_order=5;
+  n_point=6;//n_order+1
+  min_limit= ((n_order+1)/2)-1; 
+  max_limit=(n_order+1)/2;
+  b_lx=8.0*Pi;
+  delta_x=b_lx/Nx_;
+
+ cout<<"delta_x= "<<delta_x<<endl;
+
+  int n_time,n_limit,index,add_time_index,n_tau;
+  int i,j,nx,nxi,nx1,ny,nz,nxx,nzz,jj;
+  double norm_fact;
+  string rough_line;
+  int n_step=0;
+  // cin.get();
+  int initial_file=0;
+  int n_file;  
+
+double x[50],data_for_interpolation[50];
+ //-----memory allocation for the arrays -------------------
+
+  N_count= new int [n_corre_length];
+	  y  =new float [Ny_];
+
+
+ //omega_avg= new float *[n_limit];
+	//for( i=0;i<n_limit;i++)omega_avg[i]=new float[n_data];
+	
+	omega_mean= new float[Ny_*Nd_];
+        u_mean= new float[Ny_*Nd_];
+
+	omega=new float *[n_origin+n_corre_length];
+	for(i=0;i<(n_origin+n_corre_length);i++)omega[i]= new float[omega_dimen];
+
+	omega_pdt=new float *[n_corre_length];
+	for(i=0;i<n_corre_length;i++)omega_pdt[i]=new float [omega_pdt_dimen];
+
+	Romegaomega=new float *[n_corre_length];
+	for(i=0;i<n_corre_length;i++)Romegaomega[i]=new float [Romegaomega_dimen];
+
+	omega_inst= new float [n_data];
+
+
+     for(i=0;i<4;i++)
+      for(ny=0;ny<Ny_;ny++)
+	for(n_tau=0;n_tau<n_corre_length;n_tau++)
+	  Romegaomega[n_tau][flatten(ny,i)]=0.0;
+
+
+
+
+ for(i=0;i<4;i++)
+      for(ny=0;ny<Ny_;ny++)
+	for(n_tau=0;n_tau<n_corre_length;n_tau++)
+	  Romegaomega[n_tau][flatten(ny,i)]=0.0;
+
+ 
+ while((n_step+1)*n_origin+n_corre_length<Max_time_step)             // while loop starts here
+    {
+      if (n_step==0)
+	{  
+	  n_limit=n_corre_length+n_origin;
+	  add_time_index=0;
+	}
+      else
+	{ 
+	  n_limit=n_origin;
+	  initial_file=n_step*n_origin+n_corre_length;
+	  add_time_index=n_corre_length;
+	}
+ 
+     
+
+ if(n_step==0)
+    { 
+
+
+string infile20("/home/ankit/dns/examples/channel/re2500_1/Umean");
+infile20 += ".asc";
+ifstream is20(infile20.c_str(),ios::in);
+
+ if (!is20.good()) {
+    cerr << "can't open file " 
+	 << infile20 << endl;
+    exit(1);
+ }
+
+ getline(is20,rough_line); 
+
+ for(ny=0;ny<Ny_;ny++)
+   {
+     is20>>u_mean[flatten(ny,0)];
+     //cout<<ny<<"      "<<u_mean[flatten(ny,0)]<<endl;
+   }
+ is20.close();
+
+string infile2("/home/ankit/dns/examples/channel/re2500_1/Umeany");
+infile2 += ".asc";
+ifstream is2(infile2.c_str(),ios::in);
+
+ if (!is2.good()) {
+    cerr << "can't open file " 
+	 << infile2 << endl;
+    exit(1);
+ }
+
+ getline(is2,rough_line); 
+
+ for(ny=0;ny<Ny_;ny++)
+   {
+     is2>>omega_mean[flatten(ny,2)];
+     //cout<<ny<<"      "<<omega_mean[flatten(ny,0)]<<endl;
+   }
+ is2.close();
+
+
+string infile3("/home/ankit/dns/examples/channel/re2500_1/y");
+infile3 += ".asc";
+ifstream is3(infile3.c_str(),ios::in);
+
+ if (!is3.good()) {
+    cerr << "can't open file " 
+	 << infile3 << endl;
+    exit(1);
+ }
+
+getline(is3,rough_line); 
+
+ for(ny=0;ny<Ny_;ny++)
+   {
+     is3>>y[ny];
+     cout<<y[ny]<<endl;
+        }
+
+ is3.close();
+
+for(ny=0;ny<Ny_;ny++)
+   {
+
+     u_mean[flatten(ny,0)]=u_mean[flatten(ny,0)];
+cout<<ny<<"      "<<u_mean[flatten(ny,0)]<<endl;
+
+  }
+
+ for(ny=0;ny<Ny_;ny++)
+   {
+
+     omega_mean[flatten(ny,2)]=omega_mean[flatten(ny,2)];
+cout<<ny<<"      "<<omega_mean[flatten(ny,2)]<<endl;
+
+  }
+
+// cin.get();
+
+  for(ny=0;ny<Ny_;ny++)
+   {
+    u_mean[flatten(ny,1)]=0;
+    u_mean[flatten(ny,2)]=0;
+   }
+
+ for(ny=0;ny<Ny_;ny++)
+   {
+    omega_mean[flatten(ny,0)]=0;
+    omega_mean[flatten(ny,1)]=0;
+   }
+
+    } // end of the if loop for n_step==0
+
+
+
+  for(n_time=0;n_time<n_limit;n_time++)
+    {
+      n_file=initial_file+n_time+1;    // 1 is added since file storage starts from omega1.asc
+
+string infile1("/home/ankit/dns/examples/channel/re2500_1/omega"+i2s(n_file));
+infile1 += ".ff";
+//ifstream is1(infile1.c_str(),ios::in | ios::binary);
+ifstream is1(infile1.c_str(),ios::in | ios::binary);
+ if (!is1.good()) {
+    cerr << "can't open file " 
+	 << infile1 << endl;
+    exit(1);
+ }
+cout<<" Reading file  "<<infile1<<endl;
+
+ //----------- for reading ascii file------------------
+ 
+/* for(i=0;i<14;i++)        
+ getline(is1,rough_line);
+
+  //cout<<rough_line<<endl;
+ 
+ for(index=0;index<n_data;index++)
+   {
+     if(is1.eof()){cout<<"error---in file  "<<is1<<endl; exit(1);}
+   is1>>omega_inst[n_time][index];
+   //cout<<omega_inst[n_time][index]<<endl;
+   //cin.get();
+      }
+ //cin.get();
+ is1.close();
+    
+*/
+ 
+ //-----------------for reading binary file---------------
+
+  read(is1, major_version);
+  read(is1, minor_version);
+  read(is1, update_version);
+  read(is1, rough_Nx_);
+  read(is1, rough_Ny_);
+  read(is1, rough_Nz_);
+  read(is1, rough_Nd_);
+  read(is1, xzstate_);
+  read(is1, ystate_);
+  read(is1, rough_Lx_);
+  read(is1, rough_Lz_);
+  read(is1, rough_a_);
+  read(is1, rough_b_);
+  read(is1, dealiasIO_);
+
+  // cout<<major_version<<" "<<minor_version<<" "<<rough_Nx_<<" "<<rough_Ny_<<endl;
+
+  for(index=0;index<n_data;index++)
+  {
+   read(is1,omega_read);
+   omega_inst[index]=(float)omega_read;
+   //cout<<omega_inst[n_time][index]<<endl;
+   // cin.get();
+   }
+ 
+ is1.close();
+
+      i=2;
+      for(ny=0;ny<Ny_;ny++)
+	for(nx=0;nx<Nx_;nx++)
+	   for(nz=0;nz<Nz_;nz=nz++){
+	    omega[n_time+add_time_index][flatten(nx,ny,nz,i)]=omega_inst[flatten(nx,ny,nz,i)]-
+(omega_mean[flatten(ny,i)]-4*(y[ny]-(b+a)/2)/(b-a));
+//	 cout<< omega_inst[flatten(10,10,10,i)]<<"    "<<omega_mean[flatten(10,i)]<<"     "<<4*(y[10]-(b+a)/2)/(b-a)<<"    "<<y[10]<<endl;
+}	  
+
+//for(ny=0;ny<Ny_;ny++)
+ // cout<<omega_mean[flatten(ny,i)]<<"    "<<4*abs(y[ny]-(b+a)/2)/(b-a)<<endl;
+
+
+ for(i=0;i<Nd_-1;i++)
+   for(ny=0;ny<Ny_;ny++)
+	for(nx=0;nx<Nx_;nx++)
+	   for(nz=0;nz<Nz_;nz=nz++)
+	     omega[n_time+add_time_index][flatten(nx,ny,nz,i)]=omega_inst[flatten(nx,ny,nz,i)]+omega_mean[flatten(ny,i)];
+	    
+	
+    }
+
+ 
+  /*
+
+
+ // ------------Loop for X-Z averaging-------------
+
+  for(n_time=0;n_time<n_limit;n_time++)
+   {
+ cout<< "X-z averaging for time "<<n_time<<endl;
+   for(i=0;i<3;i++)
+      for(ny=0;ny<Ny_;ny++)
+       {
+
+       omega_avg[n_time][flatten(ny,i)]=0.0;
+
+       for(nx=0;nx<Nx_;nx++)
+	 for(nz=0;nz<Nz_;nz++)
+	   {//cout<<" nz  "<<nz<<endl;
+  omega_avg[n_time][flatten(ny,i)]= omega_avg[n_time][flatten(ny,i)]+ omega_inst[n_time][flatten(nx,ny,nz,i)];
+	   }
+     omega_avg[n_time][flatten(ny,i)]= omega_avg[n_time][flatten(ny,i)]/(Nx_*Nz_);
+       }
+   }
+ cout<<" X-Z ageraging is done" <<endl;
+
+
+ //-------------Loop for time averaging-------------------
+
+ for(i=0;i<3;i++)
+      for(ny=0;ny<Ny_;ny++)
+       {
+	 omega_mean[flatten(ny,i)]=0.0;
+      for(n_time=0;n_time<n_limit;n_time++)
+	omega_mean[flatten(ny,i)]=omega_mean[flatten(ny,i)]+ omega_avg[n_time][flatten(ny,i)];
+       
+ omega_mean[flatten(ny,i)]=omega_mean[flatten(ny,i)]/n_limit;
+       }
+ cout<<" time  ageraging is done" <<endl;
+
+ofstream os2("/home/hpcscratch/chepart/channel_dns/run4/Umean_calculated_3.asc",ios::out);
+os2 << scientific << setprecision(10);
+for( ny=0;ny<Ny_;ny=ny+1)
+    { 
+      os2<<ny <<"  "<<omega_mean[flatten(ny,0)]<<"  "<<omega_mean[flatten(ny,1)]<<"  "
+	 <<omega_mean[flatten(ny,2)]<<endl;
+    }
+ os2.close();
+  */
+
+ 
+
+ //--------------Calculation of the fluctuation-----------
+
+cout<< " Calculating fluctuation  "<<endl;
+/*
+ for(n_time=0;n_time<n_limit;n_time++)
+   for(i=0;i<Nd_;i++)
+      for(ny=0;ny<Ny_;ny++)
+	for(nx=0;nx<Nx_;nx++)
+	  for(nz=0;nz<Nz_;nz++)
+	omega[n_time+ add_time_index][flatten(nx,ny,nz,i)]=omega_inst[n_time][flatten(nx,ny,nz,i)]-omega_mean[flatten(ny,i)];
+     
+ // add index is to shift the  indext from zero if n_step>o, see the notes.  
+
+ for(i=0;i<n_limit;i++)
+   delete [] omega_inst[i];
+    delete []omega_inst;
+
+    //  cout<< " It is here  "<<endl;
+    */
+
+
+
+
+//------Calculation of the product of fluctuation (uu,vv,ww) with time delay ---
+
+ for(i=0;i<4;i++)
+      for(ny=0;ny<Ny_;ny++)
+	for(nx=0;nx<Nx_;nx=nx+nx_step)
+	  {nxx=nx/nx_step;
+	  for(nz=0;nz<Nz_;nz=nz+nz_step)
+	    {nzz=nz/nz_step;
+	    for(n_tau=0;n_tau<n_corre_length;n_tau++)
+	      {
+		omega_pdt[n_tau][flatten_1(nxx,ny,nzz,i)]=0;
+		}//	N_count[n_tau][flatten(nx,ny,nz,i)]=0;
+	    }
+	  }
+
+cout<< " Doing product of fluctuation  "<<endl;
+
+  for(i=0;i<3;i++)
+      for(ny=0;ny<Ny_;ny++)
+	for(nx=0;nx<Nx_;nx=nx+nx_step)
+	  {nxx=nx/nx_step;
+	    for(nz=0;nz<Nz_;nz=nz+nz_step)
+	    {nzz=nz/nz_step;
+	    for(n_time=0;n_time<n_origin;n_time++)
+	      for(j=n_time;j<n_time+n_corre_length;j++)
+		{
+		  n_tau=j-n_time;
+		  x_p=nx*delta_x+ n_tau*del_t*u_mean[flatten(ny,2)];
+		
+	    if(x_p>b_lx)x_p=x_p-(int(x_p/b_lx)*b_lx);
+	    if(x_p<0)x_p=x_p+(int(x_p/b_lx)*b_lx+b_lx);
+
+	    nx_part=int(x_p/delta_x);
+		    for(nxi=nx_part-min_limit; nxi<=nx_part+max_limit; ++nxi){
+		      jj=nxi-(nx_part-min_limit);
+		      x[jj]=nxi*delta_x;
+
+		      //cout<<" jj   "<<jj<<" "<<x[jj]<<endl;
+		      //cin.get();
+		      nx1=nxi;
+		      if(nx1<0)nx1=nxi+Nx_;   if(nx1>(Nx_-1))nx1=nxi-Nx_; 
+		   
+		      data_for_interpolation[jj]=omega[j][flatten(nx1,ny,nz,i)];
+		    }
+		    polint(x,data_for_interpolation,n_point,x_p,&omega_interpolated, &error);
+		    /*if(ny==30){cout<<x[0]<<"   " <<x[1]<<" "<<x[2]<<"   "<<x[3]<<" "<<x[4]<<"   "<<x[5]<<endl;
+		    cout<<" at--- "<<x_p <<endl;
+		               cout<<data_for_interpolation[0]<<" "<<data_for_interpolation[1]<<" "<<
+				 " "<<data_for_interpolation[2]<<" "<< " "<<data_for_interpolation[3]<<
+                                  " "<<data_for_interpolation[4]<<" "<<data_for_interpolation[5]<<endl;
+		              cout<<" ######  "<<omega_interpolated<<endl;;
+			      cin.get();}*/
+   
+   omega_pdt[n_tau][flatten_1(nxx,ny,nzz,i)]=omega_pdt[n_tau][flatten_1(nxx,ny,nzz,i)]+ 
+     omega[n_time][flatten(nx,ny,nz,i)]* omega_interpolated;
+   
+     //   N_count[n_tau][flatten(nx,ny,nz,i)]=N_count[n_tau][flatten(nx,ny,nz,i)]+1;
+		}
+	    }
+	  }
+
+ 
+ //cout<<"------Calculation of the product of fluctuation (uv) with time delay ---"<<endl;
+ for(ny=0;ny<Ny_;ny++)
+	for(nx=0;nx<Nx_;nx=nx+nx_step)
+	  {nxx=nx/nx_step;
+	  for(nz=0;nz<Nz_;nz=nz+nz_step)
+	    {nzz=nz/nz_step;
+	    for(n_time=0;n_time<n_origin;n_time++)
+	      for(j=n_time;j<n_time+n_corre_length;j++)
+		{
+		  n_tau=j-n_time;
+
+		  x_p=nx*delta_x+n_tau*del_t*u_mean[flatten(ny,0)];
+	    if(x_p>b_lx)x_p=x_p-(int(x_p/b_lx)*b_lx);
+	    if(x_p<0)x_p=x_p+(int(x_p/b_lx)*b_lx+b_lx);
+	    nx_part=int(x_p/delta_x);
+		    for ( nxi=nx_part-min_limit; nxi<=nx_part+max_limit; ++nxi){
+		      jj=nxi-(nx_part-min_limit);
+		      x[jj]=nxi*delta_x;
+		      nx1=nxi;
+		      if(nx1<0)nx1=nxi+Nx_;if(nx1>(Nx_-1))nx1=nxi-Nx_;  
+		      data_for_interpolation[jj]=omega[j][flatten(nx1,ny,nz,1)];
+		    }
+		    polint(x,data_for_interpolation,n_point,x_p,&omega_interpolated, &error);
+
+
+    omega_pdt[n_tau][flatten_1(nxx,ny,nzz,3)]=omega_pdt[n_tau][flatten_1(nxx,ny,nzz,3)]+ 
+                             omega[n_time][flatten(nx,ny,nz,0)]* omega_interpolated;
+   
+    // N_count[n_tau][flatten(nx,ny,nz,3)]=N_count[n_tau][flatten(nx,ny,nz,3)]+1;
+
+		}
+	    }
+	  }
+   
+   cout<< " Doing time average of product of fluctuation  "<<endl;
+
+ // ---------Time averaging of the product of fluctuation---uv also considered----------
+
+ for(i=0;i<4;i++)
+      for(ny=0;ny<Ny_;ny++)
+	for(nx=0;nx<Nx_;nx=nx+nx_step)
+	  {nxx=nx/nx_step;
+	  for(nz=0;nz<Nz_;nz=nz+nz_step)
+	    {nzz=nz/nz_step;
+	    for(n_tau=0;n_tau<n_corre_length;n_tau++)
+	      omega_pdt[n_tau][flatten_1(nxx,ny,nzz,i)]= omega_pdt[n_tau][flatten_1(nxx,ny,nzz,i)]/n_origin;
+  //omega_pdt[n_tau][flatten(nx,ny,nz,i)]= omega_pdt[n_tau][flatten(nx,ny,nz,i)]/ N_count[n_tau][flatten(nx,ny,nz,i)];
+	    }
+	  }
+
+
+  //----------------- X-Z averaging of the product of fluctuation---------
+
+cout<< " Doing X-Z average of product of fluctuation  "<<endl;
+
+  for(i=0;i<4;i++)
+      for(ny=0;ny<Ny_;ny++)
+	for(n_tau=0;n_tau<n_corre_length;n_tau++)
+	  {	
+	    float sum=0.0;
+            for(nx=0;nx<Nx_;nx=nx+nx_step)
+	      {
+		nxx=nx/nx_step;
+	      for(nz=0;nz<Nz_;nz=nz+nz_step)
+		{
+		  nzz=nz/nz_step;
+	       sum=sum+ omega_pdt[n_tau][flatten_1(nxx,ny,nzz,i)];
+
+	    	}
+	      }
+ Romegaomega[n_tau][flatten(ny,i)]=Romegaomega[n_tau][flatten(ny,i)]+ sum/((Nx_/nx_step)*(Nz_/nz_step));
+
+	  }
+
+
+  // -------- Shifting the data in upward in omega memory -------------------
+
+  for(n_time=0;n_time<n_corre_length;n_time++)
+   for(i=0;i<3;i++)
+      for(ny=0;ny<Ny_;ny++)
+	for(nx=0;nx<Nx_;nx++)
+	  {nxx=nx/nx_step;
+	  for(nz=0;nz<Nz_;nz++)
+	    {nzz=nz/nz_step;
+	    omega[n_time][flatten(nx,ny,nz,i)]=omega[n_time + n_origin][flatten(nx,ny,nz,i)];
+	    }
+	  }
+
+    n_step=n_step+1;
+
+
+    }  // end of the while loop
+ 
+
+
+
+ //-------------doing final time averaging-------------------------
+
+ for(i=0;i<4;i++)
+      for(ny=0;ny<Ny_;ny++)
+	for(n_tau=0;n_tau<n_corre_length;n_tau++)
+	  Romegaomega[n_tau][flatten(ny,i)]=Romegaomega[n_tau][flatten(ny,i)]/n_step;
+
+
+ofstream os1("/home/ankit/dns/examples/channel/re2500_1/omegaomega_ms_calculated.asc",ios::out);
+os1 << scientific << setprecision(10);
+for(int ny=0;ny<Ny_;ny=ny+1)
+    { 
+      os1<<ny <<"  "<<Romegaomega[0][flatten(ny,0)]<<"  "<<Romegaomega[0][flatten(ny,1)]<<"  "
+	 <<Romegaomega[0][flatten(ny,2)]<<"  "<<Romegaomega[0][flatten(ny,3)]<<endl;
+    }
+ os1.close();
+
+
+
+  //------------ Normalization of the correlation coefficient--------------
+ cout<<" Doing normalization of correlation function "<<endl;
+
+  for(i=0;i<4;i++)
+      for(ny=0;ny<Ny_;ny++)
+	for(n_tau=0;n_tau<n_corre_length;n_tau++)
+	  {
+	    if(n_tau==0)norm_fact=Romegaomega[0][flatten(ny,i)];
+	  Romegaomega[n_tau][flatten(ny,i)]=(Romegaomega[n_tau][flatten(ny,i)])/norm_fact;
+	  }
+
+  //----------Writing the Romegaomega vs tau for different ny---------------------
+    
+  cout<<" Printing the output"<<endl;
+
+  for(int ny=0;ny<Ny_;ny=ny+1)
+    { 
+      string filename("/home/ankit/dns/examples/channel/re2500_1/corre_coeff_calculated/corre_coeff_omega_"+i2s(ny));
+  filename += ".asc";
+  ofstream os(filename.c_str(),ios::out);
+  os << scientific << setprecision(10);
+  for(n_tau=0;n_tau<n_corre_length;n_tau++)
+  os<<n_tau<<" "<<n_tau*del_t<<"  "<<Romegaomega[n_tau][flatten(ny,0)]<<" "<<Romegaomega[n_tau][flatten(ny,1)]<< 
+    "   "<<Romegaomega[n_tau][flatten(ny,2)]<<" "<<Romegaomega[n_tau][flatten(ny,3)]<<endl;
+  os.close();
+    }
+
+  time(& end);
+  double diff_=difftime(end,start);
+  cout<< " time taken in second   "<< diff_<<endl; 
+
+  return 0;
+
+}
+
+
+
+void polint(double xa[], double ya[], int n, double x, double *yy,double *dy)
+{
+  //***** take care---- here int n is not the poly_ order it is the no of input data point
+
+int i,m,ns=0;
+double den, dif, dift,ho,hp,w;
+double *c,*d;
+c= new double [n];
+d= new double [n];
+
+//for(i=0;i<n;i++)
+ if(x>50)
+ cout<<" in polint "<<x<<endl;
+//
+// cin.get();
+dif=fabs(x-xa[0]);
+
+ for(i=0;i<n;i++)
+   {
+ if((dift=fabs(x-xa[i]))<dif)
+	{
+	ns=i;
+	dif=dift;
+	}	
+	c[i]=ya[i];
+	d[i]=ya[i];
+     }
+ *yy=ya[ns--];
+
+  for(m=1;m<n;m++)
+ {
+  for(i=0;i<n-m;i++)
+	{
+	ho=xa[i]-x;
+ hp=xa[i+m]-x;
+ w=c[i+1]-d[i];
+ //cout<<"%% den=ho-hp  "<<ho-hp<<endl;
+ if((den=ho-hp)==0.0)
+ {cout<<"error in routin polint()"<< endl;
+ cout<<i<<"   "<<m  <<"    "<<xa[i]<<"  "<<xa[i+m]<<"  "<<x<<endl;
+ for(i=0;i<n;i++)
+ cout<<xa[i]<<endl;
+  exit(0);
+  cin.get();
+ }
+ den=w/den;
+ d[i]=hp*den;
+ c[i]=ho*den;
+ }
+ *yy +=(*dy=(2*ns<(n-m)? c[ns+1] : d[ns--]));
+ }
+ delete [] d;
+ delete [] c;
+ }
+
+
+
+
+
+
+inline int flatten(int nx, int ny, int nz, int i) {
+  //cout<<" nz "<<nz<<" "<<nx<<endl;
+  assert(nx>=0 && nx<Nx_);    assert(ny>=0 && ny<Ny_); 
+  assert(nz>=0 && nz<Nz_); assert(i>=0  && i<Nd_+1);
+  return nz + Nz_*(nx + Nx_*(ny + Ny_*i));
+}
+
+
+inline int flatten(int ny,int i)
+{
+assert(ny>=0 && ny<Ny_); 
+assert(i>=0  && i<Nd_+1);
+return (ny + Ny_*i);
+}
+
+inline int flatten_1(int nx, int ny, int nz, int i) {
+  //cout<<" nz "<<nz<<" "<<nx<<endl;
+  assert(nx>=0 && nx<Nx_/nx_step);    assert(ny>=0 && ny<Ny_); 
+  assert(nz>=0 && nz<Nz_/nz_step); assert(i>=0  && i<Nd_+1);
+  return nz + (Nz_/nz_step)*(nx + (Nx_/nx_step)*(ny + Ny_*i));
+}
+
+void read(ifstream& is, bool& b) {
+  char c;
+  is.read(&c, sizeof(char));
+  b = (c=='0') ? false : true;
+}
+
+
+
+void read(ifstream& is, fieldstate& s) {
+  is >> s;
+}
+
+
+void read(ifstream& is, int& n) {
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+  uint32_t i;
+  is.read((char*)(&i), sizeof(uint32_t));
+  uint32_t j = bswap_32(i);
+  n = *((int*)(&j));
+#else
+  is.read((char*) &n, sizeof(int));
+#endif
+
+ }
+
+void write(ofstream& os, double x) {
+
+  os.write((char*) &x, sizeof(double));
+
+}
+
+void read(ifstream& is, double& x) {
+  #if __BYTE_ORDER == __LITTLE_ENDIAN
+  uint64_t i;
+  is.read((char*)(&i), sizeof(uint64_t));
+  uint64_t j = bswap_64(i);
+  x = *((double*)(&j));
+#else
+  is.read((char*) &x, sizeof(double));
+#endif
+
+ }
+
+
+
+ofstream& operator <<(ofstream& os, fieldstate f) {
+  switch (f) {
+  case Physical:
+    os << 'P';
+    break;
+  default:
+  case Spectral:
+    os << 'S';
+    break;
+  }
+  return os;
+}
+
+ifstream& operator >>(ifstream& is, fieldstate& f) {
+  char c = ' ';
+  while (c == ' ')
+    is >> c;
+  switch(c) {
+  case 'P':
+    f = Physical;
+    break;
+  case 'S':
+    f = Spectral;
+    break;
+  default:
+    cerr << "read fieldstate error: unknown fieldstate " << c << endl;
+    f = Spectral;
+    assert(false);
+  }
+  return is;
+}
